@@ -13,9 +13,58 @@
 <main><header class="topbar"><div><div class="eyebrow">Финансы · продажи · продвижение</div><h1 id="pageTitle">Обзор бизнеса</h1><span class="muted" id="periodLabel">Загрузите отчёты, чтобы начать</span></div><div class="actions"><button id="snapshot">Сохранить срез</button><button class="primary" id="upload">＋ Загрузить отчёты</button></div></header>
 <div class="filters"><label>Период с <input id="from" type="date"></label><label>по <input id="to" type="date"></label><button id="allPeriod">Весь период</button><label>Категория <select id="category"><option value="">Все категории</option></select></label><span id="busy" role="status" aria-live="polite"></span></div>
 <div id="globalNotes"></div><section class="kpis" id="kpis" aria-label="Ключевые показатели"></section><div id="content"></div>
-<footer class="footer"><span>Seller Pulse / Ozon · v1.0.0 · сборка 14.11.2026</span><span>Срезы и настройки хранятся только в этом браузере</span></footer></main></div>
+<footer class="footer"><span>Seller Pulse / Ozon · v1.0.1 · исправлено чтение кириллицы в XLSX</span><span>Срезы и настройки хранятся только в этом браузере</span></footer></main></div>
 <input hidden type="file" id="files" multiple accept=".xlsx,.xls,.csv"><dialog id="modal"></dialog><div id="toast" class="toast" role="status" hidden></div>
 <script>
+/* Совместимость с XLSX Ozon: SheetJS 0.18.5 повторно декодирует UTF-8
+   для t="str" с числовыми XML-ссылками (&#x41F;). Восстанавливаем текст
+   из исходного XML, сохраняя числа, даты, формулы и структуру SheetJS. */
+const ExcelReader = (() => {
+ function xmlText(s){
+  const named={amp:'&',lt:'<',gt:'>',quot:'"',apos:"'"};
+  return s.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos);/gi,(whole,key)=>{
+   if(key[0]!=='#')return named[key]??whole;
+   const n=key[1].toLowerCase()==='x'?parseInt(key.slice(2),16):parseInt(key.slice(1),10);
+   if(n>0x10ffff||n>=0xd800&&n<=0xdfff)throw Error('Некорректный символ в XML отчёта.');
+   return String.fromCodePoint(n);
+  });
+ }
+ function attrs(s){const out={};for(const m of s.matchAll(/([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g))out[m[1]]=xmlText(m[2]??m[3]);return out;}
+ function read(data,XLSX,options={}){
+  const book=XLSX.read(data,{...options,bookFiles:true});
+  if(!book.files)return book; // CSV и старые бинарные XLS не требуют исправления.
+  const text=path=>{const entry=book.files[path.replace(/^\//,'')];if(!entry)return null;return new TextDecoder('utf-8',{fatal:true}).decode(entry.content);};
+  const main=(book.keys??[]).find(k=>/(^|\/)workbook\.xml$/.test(k));
+  if(!main)return book;
+  const base=main.slice(0,main.lastIndexOf('/')+1),rels=text(base+'_rels/workbook.xml.rels');
+  if(!rels)return book;
+  const targets={};
+  for(const m of rels.matchAll(/<(?:\w+:)?Relationship\b([^>]*?)\/?\s*>/g)){const a=attrs(m[1]);if(a.TargetMode!=='External')targets[a.Id]=a.Target;}
+  for(const info of book.Workbook?.Sheets??[]){
+   const target=targets[info.id];if(!target||!book.Sheets[info.name])continue;
+   const path=[];for(const part of (target.startsWith('/')?target.slice(1):base+target).split('/')){if(part==='..')path.pop();else if(part&&part!=='.')path.push(part);}
+   const source=text(path.join('/'));if(!source)continue;
+   let nextRow=0;
+   for(const row of source.matchAll(/<(?:\w+:)?row\b([^>]*)>([\s\S]*?)<\/(?:\w+:)?row\s*>/g)){
+    const a=attrs(row[1]),r=a.r?Number(a.r)-1:nextRow;nextRow=r+1;let nextCol=0;
+    for(const cell of row[2].matchAll(/<(?:\w+:)?c\b([^>]*?)(?:\/\s*>|>([\s\S]*?)<\/(?:\w+:)?c\s*>)/g)){
+     const a=attrs(cell[1]),c=a.r?XLSX.utils.decode_cell(a.r).c:nextCol;nextCol=c+1;
+     if(a.t!=='str'||!cell[2])continue;
+     const value=cell[2].match(/<(?:\w+:)?v\b[^>]*>([\s\S]*?)<\/(?:\w+:)?v\s*>/);
+     if(!value||! /&#(?:x[0-9a-f]+|\d+);/i.test(value[1]))continue;
+     const address=a.r??XLSX.utils.encode_cell({r,c}),existing=book.Sheets[info.name][address];
+     if(!existing)throw Error(`Не удалось восстановить текст ячейки ${info.name}!${address}.`);
+     existing.v=xmlText(value[1]).replace(/_x([0-9a-f]{4})_/gi,(_,hex)=>String.fromCharCode(parseInt(hex,16)));
+     existing.t='s';delete existing.w;delete existing.h;delete existing.r;
+    }
+   }
+  }
+  return book;
+ }
+ return {read,xmlText};
+})();
+if(typeof module!=='undefined')module.exports=ExcelReader;
+
 /* Seller Pulse: чистые функции парсинга и единый источник формул. */
 const Core = (() => {
  const expenseKeys=['acquiring','logistics','storage','ads','commission','tax','returns','penalties','other'];
@@ -173,7 +222,7 @@ $('upload').onclick=actions.upload;$('files').onchange=async e=>{await loadFiles
 $('snapshot').onclick=()=>{if(!state.reports.length){toast('Сначала загрузите отчёты.');return;}let t=model.total;state.snapshots.push({at:new Date().toISOString(),period:state.from+' — '+state.to,category:state.category,revenue:t.revenue,profit:t.profit,margin:t.margin,drr:t.drr});save();render();toast('Срез сохранён. Неизвестные показатели останутся со статусом «нет данных».');};
 function choose(title,body,options,extra=''){return new Promise(resolve=>{let d=$('modal');d.innerHTML=`<h2>${esc(title)}</h2><p>${esc(body)}</p>${extra}<div class="actions">${options.map(([key,label])=>`<button data-choice="${key}">${esc(label)}</button>`).join('')}</div>`;d.showModal();let done=false;const finish=v=>{if(done)return;done=true;d.close();resolve(v);};d.querySelectorAll('[data-choice]').forEach(b=>b.onclick=()=>finish(b.dataset.choice));d.oncancel=e=>{e.preventDefault();finish('cancel');};});}
 // Импорт: SheetJS читает сырые значения; распознавание не зависит от имени файла.
-async function workbook(file){if(!window.XLSX)throw Error('Не загрузилась библиотека SheetJS с CDN. Проверьте интернет и обновите страницу.');let book;if(/\.csv$/i.test(file.name))book=XLSX.read(await file.text(),{type:'string',raw:true});else book=XLSX.read(await file.arrayBuffer(),{type:'array',cellDates:false});return {name:file.name,sheets:book.SheetNames.map(name=>({name,rows:XLSX.utils.sheet_to_json(book.Sheets[name],{header:1,defval:null,raw:true,blankrows:true}),merges:(book.Sheets[name]['!merges']??[]).map(m=>XLSX.utils.encode_range(m))}))};}
+async function workbook(file){if(!window.XLSX)throw Error('Не загрузилась библиотека SheetJS с CDN. Проверьте интернет и обновите страницу.');let book;if(/\.csv$/i.test(file.name))book=ExcelReader.read(await file.text(),XLSX,{type:'string',raw:true});else book=ExcelReader.read(await file.arrayBuffer(),XLSX,{type:'array',cellDates:false});return {name:file.name,sheets:book.SheetNames.map(name=>({name,rows:XLSX.utils.sheet_to_json(book.Sheets[name],{header:1,defval:null,raw:true,blankrows:true}),merges:(book.Sheets[name]['!merges']??[]).map(m=>XLSX.utils.encode_range(m))}))};}
 async function loadFiles(files){if(uploading)return;uploading=true;$('upload').disabled=true;let results=[];for(let f of files){$('busy').textContent='Читаем '+f.name;try{await new Promise(r=>setTimeout(r,20));let wb=await workbook(f),rep=Core.inspect(wb);if(rep.unknown){let extra='<details open><summary>Листы и первые строки</summary><pre>'+esc(JSON.stringify(rep.sheets,null,2))+'</pre></details>';let type=await choose('Не удалось уверенно определить тип',f.name+': совпало меньше половины ключевых колонок. Выберите тип вручную. Обязательные колонки всё равно будут проверены.',[...Object.entries(Core.profiles).map(([k,v])=>[k,v.title]),['cancel','Пропустить']],extra);if(type==='cancel')continue;rep=Core.inspect(wb,type);if(rep.unknown)throw Error(f.name+': выбранная структура не совпадает с колонками. Нужна адаптация парсера; обнаруженные листы: '+wb.sheets.map(s=>s.name).join(', '));}
  if(rep.needsDate){let selected=await choose('Дата снимка остатков',`${f.name}: в таблице нет полной даты. Укажите дату, на которую выгружены остатки.`,[['ok','Применить дату'],['cancel','Пропустить']],`<label>Дата остатков <input id="stockAsOf" type="date" value="${today()}"></label>`);if(selected==='cancel')continue;rep.asOf=$('stockAsOf').value;if(!Core.date(rep.asOf))throw Error('Не указана корректная дата остатков.');rep.from=rep.asOf;rep.to=rep.asOf;}
  let overlap=state.reports.filter(r=>r.type===rep.type&&(rep.type==='stock'?r.asOf===rep.asOf:r.from<=rep.to&&r.to>=rep.from));if(overlap.length){let action=await choose('Периоды перекрываются',`${f.name} перекрывает ${overlap.length} источников того же типа за ${rep.from} — ${rep.to}. Заменить: старые строки внутри периода удалятся. Периодные сводки рекламы заменяются целиком. Объединить: строки будут добавлены, возможны дубли и завышение сумм.`,[['replace','Заменить период'],['merge','Объединить с возможными дублями'],['cancel','Пропустить файл']]);if(action==='cancel')continue;if(action==='replace'){for(let old of overlap){if(old.records.some(r=>r.date)&&rep.type!=='stock'){old.records=old.records.filter(r=>r.date<rep.from||r.date>rep.to);old.count=old.records.length;if(old.records.length){let ds=old.records.map(r=>r.date).filter(Boolean).sort();old.from=ds[0];old.to=ds.at(-1);}}else old.records=[];}state.reports=state.reports.filter(r=>r.records.length);}}
@@ -183,3 +232,4 @@ async function loadFiles(files){if(uploading)return;uploading=true;$('upload').d
 render();
 
 </script></body></html>
+
